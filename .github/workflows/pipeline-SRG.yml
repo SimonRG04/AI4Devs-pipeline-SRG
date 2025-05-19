@@ -112,7 +112,7 @@ jobs:
           cp -r dist prisma package.json package-lock.json deployment/
           cd deployment
           echo "NODE_ENV=production" > .env
-          echo "DATABASE_URL=${{ secrets.DATABASE_URL }}" >> .env
+          echo "DATABASE_URL=postgresql://test:test@localhost:5432/testdb" >> .env
           cd ..
           tar -czf backend-deployment.tar.gz deployment
       
@@ -147,7 +147,6 @@ jobs:
           [ -z "${{ secrets.EC2_SSH_PRIVATE_KEY }}" ] && missing_secrets+=("EC2_SSH_PRIVATE_KEY")
           [ -z "${{ secrets.EC2_HOST }}" ] && missing_secrets+=("EC2_HOST")
           [ -z "${{ secrets.EC2_USER }}" ] && missing_secrets+=("EC2_USER")
-          [ -z "${{ secrets.DATABASE_URL }}" ] && missing_secrets+=("DATABASE_URL")
           
           if [ ${#missing_secrets[@]} -ne 0 ]; then
             echo "Error: Los siguientes secrets son necesarios pero no están definidos:"
