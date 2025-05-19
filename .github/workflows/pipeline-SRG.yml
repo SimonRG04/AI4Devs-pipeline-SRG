@@ -176,6 +176,13 @@ jobs:
           chmod 600 ~/.ssh/id_rsa
           
           # Generar y mostrar la clave pública correspondiente
+          ssh-keygen -y -f ~/.ssh/id_rsa || { 
+            echo "ERROR: No se pudo generar la clave pública. Verificar formato de la clave privada"; 
+            echo "Primeras líneas de la clave privada:";
+            head -n 2 ~/.ssh/id_rsa | cat -A;
+            exit 1; 
+          }
+          
           ssh-keygen -y -f ~/.ssh/id_rsa > ~/.ssh/id_rsa.pub
           
           echo "=========================================================="
@@ -189,11 +196,22 @@ jobs:
           echo "echo '$(cat ~/.ssh/id_rsa.pub)' >> ~/.ssh/authorized_keys"
           echo "=========================================================="
       
-      # Intentar conexión con claves explícitas
+      # Intentar conexión con claves explícitas y verificación exhaustiva
       - name: Test SSH connection
         run: |
+          # Configurar SSH con mayor nivel de debug
+          echo "LogLevel DEBUG3" >> ~/.ssh/config
+          chmod 600 ~/.ssh/config
+          
           # Probar conexión con verbose y timeout extendido
-          ssh -v -o StrictHostKeyChecking=no -o ConnectTimeout=30 -i ~/.ssh/id_rsa ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} "echo 'Prueba de conexión'" || echo "Fallo de conexión SSH, pero continuamos con método alternativo"
+          ssh -vvv -o StrictHostKeyChecking=no -o ConnectTimeout=30 -i ~/.ssh/id_rsa ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} "echo 'Prueba de conexión'" || {
+            echo "ERROR: Fallo de conexión SSH"
+            echo "Verificando formato de la clave:"
+            file ~/.ssh/id_rsa
+            echo "Verificando permisos:"
+            ls -la ~/.ssh/
+            echo "Continuamos con método alternativo"
+          }
       
       # Usar acción SSH dedicada como alternativa
       - name: Desplegar con SSH Action
@@ -202,6 +220,9 @@ jobs:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+          port: 22
+          command_timeout: 60m
+          debug: true
           script: |
             echo "Conexión SSH establecida correctamente desde la acción SSH"
             echo "Verificando sistema:"
@@ -218,6 +239,8 @@ jobs:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+          port: 22
+          debug: true
           source: "backend-deployment.tar.gz"
           target: "/tmp"
           
@@ -228,6 +251,9 @@ jobs:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+          port: 22
+          command_timeout: 60m
+          debug: true
           script: |
             set -e  # Detener en caso de error
             
