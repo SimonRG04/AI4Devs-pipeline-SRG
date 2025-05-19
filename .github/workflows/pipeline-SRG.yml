@@ -128,6 +128,8 @@ jobs:
   deploy:
     needs: build
     runs-on: ubuntu-latest
+    # Especificar el entorno donde están configurados los secrets
+    environment: Testing
     
     # Validamos que el PR esté abierto
     if: needs.check_pr.outputs.has_pr == 'true'
