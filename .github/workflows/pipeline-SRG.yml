@@ -129,11 +129,12 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     
-    # Validamos que los secrets necesarios existan antes de ejecutar el job
-    if: ${{ needs.check_pr.outputs.has_pr == 'true' && secrets.AWS_REGION != '' }}
+    # Validamos que el PR esté abierto
+    if: needs.check_pr.outputs.has_pr == 'true'
     
     steps:
       - name: Verify required secrets
+        id: check_secrets
         run: |
           missing_secrets=()
           
