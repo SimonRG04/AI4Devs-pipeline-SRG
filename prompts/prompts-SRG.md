@@ -26,3 +26,8 @@ Además, para cada paso principal del pipeline, proporciona un comentario explic
 Asegúrate de que el archivo YAML esté correctamente indentado y siga las mejores prácticas de GitHub Actions.
 
 No des nada por hecho y pregunta lo que sea necesario.
+
+# Prompt 3 para Claude 3.7 utilizando modo Thinking y Agent
+
+Como experto en Devops, podrías revisar este error que ha surgido al momento de hacer el deploy en el GitHub Actions "Run aws-actions/configure-aws-credentials@v4
+Error: Input required and not supplied: aws-region". Adicionalmente revisa que otros errores pueden surgir al momento del despliegue para mitigarlos

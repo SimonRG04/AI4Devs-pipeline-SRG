@@ -129,7 +129,31 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     
+    # Validamos que los secrets necesarios existan antes de ejecutar el job
+    if: ${{ needs.check_pr.outputs.has_pr == 'true' && secrets.AWS_REGION != '' }}
+    
     steps:
+      - name: Verify required secrets
+        run: |
+          missing_secrets=()
+          
+          # Verificar que existan todos los secrets necesarios para el despliegue
+          [ -z "${{ secrets.AWS_ACCESS_KEY_ID }}" ] && missing_secrets+=("AWS_ACCESS_KEY_ID")
+          [ -z "${{ secrets.AWS_SECRET_ACCESS_KEY }}" ] && missing_secrets+=("AWS_SECRET_ACCESS_KEY")
+          [ -z "${{ secrets.AWS_REGION }}" ] && missing_secrets+=("AWS_REGION")
+          [ -z "${{ secrets.EC2_SSH_PRIVATE_KEY }}" ] && missing_secrets+=("EC2_SSH_PRIVATE_KEY")
+          [ -z "${{ secrets.EC2_HOST }}" ] && missing_secrets+=("EC2_HOST")
+          [ -z "${{ secrets.EC2_USER }}" ] && missing_secrets+=("EC2_USER")
+          [ -z "${{ secrets.DATABASE_URL }}" ] && missing_secrets+=("DATABASE_URL")
+          
+          if [ ${#missing_secrets[@]} -ne 0 ]; then
+            echo "Error: Los siguientes secrets son necesarios pero no están definidos:"
+            printf "  - %s\n" "${missing_secrets[@]}"
+            exit 1
+          fi
+          
+          echo "Todos los secrets necesarios están configurados"
+      
       - name: Download artifact
         uses: actions/download-artifact@v4
         with:
@@ -144,6 +168,18 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
       
+      # Verificar la conexión a AWS
+      - name: Verify AWS Connection
+        run: |
+          echo "Verificando conexión a AWS..."
+          # Verificar que las credenciales de AWS funcionan correctamente
+          aws sts get-caller-identity
+          if [ $? -ne 0 ]; then
+            echo "Error: No se pudo establecer conexión con AWS. Verifica las credenciales."
+            exit 1
+          fi
+          echo "Conexión a AWS establecida correctamente."
+      
       # Configurar SSH para conectarse a la instancia EC2
       # Este paso prepara la autenticación SSH para la conexión segura a la instancia
       - name: Setup SSH
@@ -153,38 +189,72 @@ jobs:
           chmod 600 ~/.ssh/id_rsa
           ssh-keyscan -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts
       
+      # Verificar la conexión SSH
+      - name: Verify SSH Connection
+        run: |
+          echo "Verificando conexión SSH a la instancia EC2..."
+          ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} "echo 'Conexión SSH establecida correctamente'"
+          if [ $? -ne 0 ]; then
+            echo "Error: No se pudo establecer conexión SSH con la instancia. Verifica la clave SSH y los datos de la instancia."
+            exit 1
+          fi
+      
       # Transferir los archivos a la instancia EC2
       # Este paso envía el paquete de despliegue a la instancia de EC2 
       - name: Transfer files to EC2
         run: |
+          echo "Transfiriendo archivos a la instancia EC2..."
           scp -o StrictHostKeyChecking=no backend-deployment.tar.gz ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:/tmp/
+          if [ $? -ne 0 ]; then
+            echo "Error: No se pudieron transferir los archivos a la instancia EC2."
+            exit 1
+          fi
+          echo "Archivos transferidos correctamente."
       
       # Ejecutar comandos de despliegue en la instancia EC2
       # Este paso despliega la aplicación en el servidor, descomprimiendo los archivos,
       # instalando dependencias y reiniciando el servicio
       - name: Deploy to EC2
         run: |
+          echo "Iniciando despliegue en la instancia EC2..."
           ssh -o StrictHostKeyChecking=no ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'EOF'
-            # Detener el servicio actual
-            sudo systemctl stop backend-service || true
+            set -e  # Detener en caso de error
             
+            echo "Deteniendo el servicio actual..."
+            # Detener el servicio actual si existe
+            if systemctl is-active --quiet backend-service; then
+              sudo systemctl stop backend-service || echo "No se pudo detener el servicio, pero continuamos"
+            else
+              echo "El servicio no está actualmente en ejecución"
+            fi
+            
+            echo "Limpiando directorio anterior..."
             # Limpiar directorio anterior si existe
             sudo rm -rf /opt/backend
             sudo mkdir -p /opt/backend
             
+            echo "Descomprimiendo el nuevo paquete..."
             # Descomprimir el nuevo paquete
-            sudo tar -xzf /tmp/backend-deployment.tar.gz -C /opt/
-            sudo mv /opt/deployment/* /opt/backend/
+            if [ ! -f /tmp/backend-deployment.tar.gz ]; then
+              echo "Error: El archivo de despliegue no existe en /tmp/"
+              exit 1
+            fi
+            
+            sudo tar -xzf /tmp/backend-deployment.tar.gz -C /opt/ || { echo "Error al descomprimir"; exit 1; }
+            sudo mv /opt/deployment/* /opt/backend/ || { echo "Error al mover archivos"; exit 1; }
             sudo rm -rf /opt/deployment
             sudo rm /tmp/backend-deployment.tar.gz
             
+            echo "Configurando permisos..."
             # Configurar permisos
             sudo chown -R $USER:$USER /opt/backend
             
+            echo "Instalando dependencias de producción..."
             # Instalar dependencias de producción
             cd /opt/backend
             npm ci --only=production
             
+            echo "Configurando el servicio systemd..."
             # Crear o actualizar el servicio systemd
             sudo tee /etc/systemd/system/backend-service.service > /dev/null << 'EOT'
             [Unit]
@@ -203,11 +273,30 @@ jobs:
             WantedBy=multi-user.target
             EOT
             
+            echo "Recargando configuración de systemd..."
             # Recargar configuración systemd y reiniciar el servicio
             sudo systemctl daemon-reload
             sudo systemctl enable backend-service
+            
+            echo "Iniciando el servicio..."
             sudo systemctl start backend-service
             
+            echo "Verificando estado del servicio..."
             # Verificar estado del servicio
             sudo systemctl status backend-service --no-pager
-          EOF 
+            
+            # Verificar que el servicio está realmente en ejecución
+            if ! systemctl is-active --quiet backend-service; then
+              echo "ERROR: El servicio no se inició correctamente"
+              exit 1
+            else
+              echo "Servicio desplegado y en ejecución correctamente"
+            fi
+          EOF
+          
+          if [ $? -ne 0 ]; then
+            echo "Error durante el despliegue en la instancia EC2."
+            exit 1
+          fi
+          
+          echo "¡Despliegue completado con éxito!" 
