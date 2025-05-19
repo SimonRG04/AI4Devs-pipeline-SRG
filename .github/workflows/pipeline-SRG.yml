@@ -171,43 +171,57 @@ jobs:
           echo "Verificando detalles de AWS_REGION..."
           echo "Región: ${{ secrets.AWS_REGION || 'No configurado' }}"
       
-      # Omitimos temporalmente la configuración de AWS y verificación
-      # para centrarnos en la conexión SSH directa
-      
-      # Configurar SSH para conectarse a la instancia EC2
-      # Este paso prepara la autenticación SSH para la conexión segura a la instancia
+      # Configurar SSH con mejor formato de clave
       - name: Setup SSH
         run: |
           mkdir -p ~/.ssh
-          echo "${{ secrets.EC2_SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          
+          # Corregir formato de la clave SSH
+          echo "${{ secrets.EC2_SSH_PRIVATE_KEY }}" | sed 's/\\n/\n/g' > ~/.ssh/id_rsa
+          
+          # Verificar formato de la clave
+          echo "Primeras líneas de la clave:"
+          head -n 2 ~/.ssh/id_rsa
+          echo "Últimas líneas de la clave:"
+          tail -n 2 ~/.ssh/id_rsa
+          
+          # Corregir permisos
           chmod 600 ~/.ssh/id_rsa
-          echo "Intentando obtener la huella digital del host remoto..."
-          ssh-keyscan -v -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts || echo "No se pudo obtener la huella digital, pero continuamos"
+          
+          # Mostrar tipo de archivo para diagnóstico
+          file ~/.ssh/id_rsa
+          
+          # Obtener huella digital del host
+          ssh-keyscan -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts
       
-      # Verificar la conexión SSH con más opciones de diagnóstico
+      # Verificar la conexión SSH con enfoque alternativo
       - name: Verify SSH Connection
         run: |
           echo "Verificando detalles de la conexión SSH:"
           echo "Host: ${{ secrets.EC2_HOST }}"
           echo "Usuario: ${{ secrets.EC2_USER }}"
-          echo "Verificando que la clave SSH está configurada correctamente..."
-          ls -la ~/.ssh/
           
-          echo "Intentando conexión SSH con opciones de verbose..."
-          ssh -v -o StrictHostKeyChecking=no -o ConnectTimeout=30 ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} "echo 'Conexión SSH establecida correctamente'"
+          # Intentar conexión con opciones de autenticación explícitas
+          ssh -v -o StrictHostKeyChecking=no -o ConnectTimeout=30 -i ~/.ssh/id_rsa ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} "echo 'Conexión SSH establecida correctamente'"
+          
           if [ $? -ne 0 ]; then
-            echo "Error: No se pudo establecer conexión SSH con la instancia. Verificando accesibilidad..."
-            # Intentar verificar si el host es accesible
+            echo "Error: No se pudo establecer conexión SSH. Generando nueva clave para prueba:"
+            
+            # Generar una nueva clave para diagnóstico
+            ssh-keygen -t rsa -f ~/.ssh/test_key -N ""
+            echo "Clave de prueba generada. Si quieres usar esta clave:"
+            cat ~/.ssh/test_key.pub
+            
+            echo "Verificando accesibilidad del host..."
             ping -c 4 ${{ secrets.EC2_HOST }} || echo "El host no responde a ping"
             exit 1
           fi
       
       # Transferir los archivos a la instancia EC2
-      # Este paso envía el paquete de despliegue a la instancia de EC2 
       - name: Transfer files to EC2
         run: |
           echo "Transfiriendo archivos a la instancia EC2..."
-          scp -v -o StrictHostKeyChecking=no backend-deployment.tar.gz ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:/tmp/
+          scp -v -o StrictHostKeyChecking=no -i ~/.ssh/id_rsa backend-deployment.tar.gz ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:/tmp/
           if [ $? -ne 0 ]; then
             echo "Error: No se pudieron transferir los archivos a la instancia EC2."
             exit 1
@@ -215,12 +229,10 @@ jobs:
           echo "Archivos transferidos correctamente."
       
       # Ejecutar comandos de despliegue en la instancia EC2
-      # Este paso despliega la aplicación en el servidor, descomprimiendo los archivos,
-      # instalando dependencias y reiniciando el servicio
       - name: Deploy to EC2
         run: |
           echo "Iniciando despliegue en la instancia EC2..."
-          ssh -o StrictHostKeyChecking=no ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'EOF'
+          ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_rsa ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'EOF'
             set -e  # Detener en caso de error
             
             echo "Deteniendo el servicio actual..."
