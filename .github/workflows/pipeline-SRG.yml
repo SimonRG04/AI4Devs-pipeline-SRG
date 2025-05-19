@@ -4,7 +4,7 @@ name: CI/CD Pipeline SRG
 on:
   push:
     branches:
-      - 'feature/test-actions'  # Cualquier rama
+      - '**'  # Cualquier rama
   pull_request:
     types: [opened, synchronize, reopened]
 
