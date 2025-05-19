@@ -1,0 +1,212 @@
+name: CI/CD Pipeline SRG
+
+# Este pipeline se activa cuando se hace push a una rama que tiene un Pull Request abierto
+on:
+  push:
+    branches:
+      - '**'  # Cualquier rama
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  # Trabajo para verificar si la rama tiene un PR abierto
+  check_pr:
+    runs-on: ubuntu-latest
+    outputs:
+      has_pr: ${{ steps.check_pr.outputs.has_pr }}
+    steps:
+      - name: Check if branch has open PR
+        id: check_pr
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const branch = context.ref.replace('refs/heads/', '');
+            
+            // Buscar PRs abiertos para esta rama
+            const pulls = await github.rest.pulls.list({
+              owner,
+              repo,
+              state: 'open',
+              head: `${owner}:${branch}`
+            });
+            
+            const hasPR = pulls.data.length > 0;
+            console.log(`Branch ${branch} has open PR: ${hasPR}`);
+            return core.setOutput('has_pr', hasPR.toString());
+
+  # Job de test que solo se ejecuta si hay un PR abierto
+  test:
+    needs: check_pr
+    if: needs.check_pr.outputs.has_pr == 'true'
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: backend/package-lock.json
+      
+      # Instalar dependencias del backend
+      - name: Install dependencies
+        working-directory: backend
+        run: npm ci
+      
+      # Generar cliente Prisma para los tests
+      - name: Generate Prisma client
+        working-directory: backend
+        run: npm run prisma:generate
+      
+      # Ejecutar los tests
+      # Este paso ejecuta todas las pruebas configuradas en Jest para validar el funcionamiento correcto del código
+      - name: Run tests
+        working-directory: backend
+        run: npm run test
+        env:
+          DATABASE_URL: ${{ secrets.TEST_DATABASE_URL || 'postgresql://test:test@localhost:5432/testdb' }}
+
+  # Job de build que solo se ejecuta si los tests pasan
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: backend/package-lock.json
+      
+      # Instalar dependencias
+      - name: Install dependencies
+        working-directory: backend
+        run: npm ci
+      
+      # Generar cliente Prisma para la build
+      - name: Generate Prisma client
+        working-directory: backend
+        run: npm run prisma:generate
+      
+      # Compilar el código TypeScript a JavaScript
+      # Este paso transpila el código TS a JS que puede ser ejecutado en producción
+      - name: Build backend
+        working-directory: backend
+        run: npm run build
+      
+      # Crear un archivo comprimido con todo lo necesario para el despliegue
+      # Este paso empaqueta el código compilado, archivos de configuración y dependencias
+      - name: Create deployment package
+        working-directory: backend
+        run: |
+          mkdir -p deployment
+          cp -r dist prisma package.json package-lock.json .env.example deployment/
+          cd deployment
+          echo "NODE_ENV=production" > .env
+          echo "DATABASE_URL=${{ secrets.DATABASE_URL }}" >> .env
+          cd ..
+          tar -czf backend-deployment.tar.gz deployment
+      
+      # Guardar el artefacto para usar en el paso de despliegue
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-build
+          path: backend/backend-deployment.tar.gz
+          retention-days: 1
+
+  # Job de despliegue que solo se ejecuta si el build es exitoso
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: backend-build
+      
+      # Configurar las credenciales de AWS
+      # Este paso establece las credenciales necesarias para interactuar con AWS
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+      
+      # Configurar SSH para conectarse a la instancia EC2
+      # Este paso prepara la autenticación SSH para la conexión segura a la instancia
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.EC2_SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts
+      
+      # Transferir los archivos a la instancia EC2
+      # Este paso envía el paquete de despliegue a la instancia de EC2 
+      - name: Transfer files to EC2
+        run: |
+          scp -o StrictHostKeyChecking=no backend-deployment.tar.gz ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:/tmp/
+      
+      # Ejecutar comandos de despliegue en la instancia EC2
+      # Este paso despliega la aplicación en el servidor, descomprimiendo los archivos,
+      # instalando dependencias y reiniciando el servicio
+      - name: Deploy to EC2
+        run: |
+          ssh -o StrictHostKeyChecking=no ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'EOF'
+            # Detener el servicio actual
+            sudo systemctl stop backend-service || true
+            
+            # Limpiar directorio anterior si existe
+            sudo rm -rf /opt/backend
+            sudo mkdir -p /opt/backend
+            
+            # Descomprimir el nuevo paquete
+            sudo tar -xzf /tmp/backend-deployment.tar.gz -C /opt/
+            sudo mv /opt/deployment/* /opt/backend/
+            sudo rm -rf /opt/deployment
+            sudo rm /tmp/backend-deployment.tar.gz
+            
+            # Configurar permisos
+            sudo chown -R $USER:$USER /opt/backend
+            
+            # Instalar dependencias de producción
+            cd /opt/backend
+            npm ci --only=production
+            
+            # Crear o actualizar el servicio systemd
+            sudo tee /etc/systemd/system/backend-service.service > /dev/null << 'EOT'
+            [Unit]
+            Description=Backend API Service
+            After=network.target
+            
+            [Service]
+            Type=simple
+            User=$USER
+            WorkingDirectory=/opt/backend
+            ExecStart=/usr/bin/npm start
+            Restart=on-failure
+            Environment=NODE_ENV=production
+            
+            [Install]
+            WantedBy=multi-user.target
+            EOT
+            
+            # Recargar configuración systemd y reiniciar el servicio
+            sudo systemctl daemon-reload
+            sudo systemctl enable backend-service
+            sudo systemctl start backend-service
+            
+            # Verificar estado del servicio
+            sudo systemctl status backend-service --no-pager
+          EOF 
