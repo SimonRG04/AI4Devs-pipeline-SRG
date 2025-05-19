@@ -1,6 +1,7 @@
 name: CI/CD Pipeline SRG
 
 # Este pipeline se activa cuando se hace push a una rama que tiene un Pull Request abierto
+# Actualización: Agregado comentario para probar el trigger del workflow
 on:
   push:
     branches:
