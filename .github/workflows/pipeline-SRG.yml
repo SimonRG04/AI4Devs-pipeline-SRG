@@ -140,10 +140,7 @@ jobs:
         run: |
           missing_secrets=()
           
-          # Verificar que existan todos los secrets necesarios para el despliegue
-          [ -z "${{ secrets.AWS_ACCESS_KEY_ID }}" ] && missing_secrets+=("AWS_ACCESS_KEY_ID")
-          [ -z "${{ secrets.AWS_SECRET_ACCESS_KEY }}" ] && missing_secrets+=("AWS_SECRET_ACCESS_KEY")
-          [ -z "${{ secrets.AWS_REGION }}" ] && missing_secrets+=("AWS_REGION")
+          # Verificar solo los secrets de EC2 que son esenciales
           [ -z "${{ secrets.EC2_SSH_PRIVATE_KEY }}" ] && missing_secrets+=("EC2_SSH_PRIVATE_KEY")
           [ -z "${{ secrets.EC2_HOST }}" ] && missing_secrets+=("EC2_HOST")
           [ -z "${{ secrets.EC2_USER }}" ] && missing_secrets+=("EC2_USER")
@@ -154,33 +151,28 @@ jobs:
             exit 1
           fi
           
-          echo "Todos los secrets necesarios están configurados"
+          echo "Todos los secrets necesarios para SSH están configurados"
       
       - name: Download artifact
         uses: actions/download-artifact@v4
         with:
           name: backend-build
       
-      # Configurar las credenciales de AWS
-      # Este paso establece las credenciales necesarias para interactuar con AWS
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.AWS_REGION }}
-      
-      # Verificar la conexión a AWS
-      - name: Verify AWS Connection
+      # Diagnóstico de red para verificar conectividad
+      - name: Network diagnostics
         run: |
-          echo "Verificando conexión a AWS..."
-          # Verificar que las credenciales de AWS funcionan correctamente
-          aws sts get-caller-identity
-          if [ $? -ne 0 ]; then
-            echo "Error: No se pudo establecer conexión con AWS. Verifica las credenciales."
-            exit 1
-          fi
-          echo "Conexión a AWS establecida correctamente."
+          echo "Diagnóstico de red:"
+          echo "Verificando resolución DNS..."
+          nslookup amazonaws.com || echo "Error en resolución DNS para amazonaws.com"
+          
+          echo "Verificando conectividad..."
+          ping -c 4 amazonaws.com || echo "Error en conectividad a amazonaws.com"
+          
+          echo "Verificando detalles de AWS_REGION..."
+          echo "Región: ${{ secrets.AWS_REGION || 'No configurado' }}"
+      
+      # Omitimos temporalmente la configuración de AWS y verificación
+      # para centrarnos en la conexión SSH directa
       
       # Configurar SSH para conectarse a la instancia EC2
       # Este paso prepara la autenticación SSH para la conexión segura a la instancia
@@ -189,15 +181,24 @@ jobs:
           mkdir -p ~/.ssh
           echo "${{ secrets.EC2_SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
-          ssh-keyscan -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts
+          echo "Intentando obtener la huella digital del host remoto..."
+          ssh-keyscan -v -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts || echo "No se pudo obtener la huella digital, pero continuamos"
       
-      # Verificar la conexión SSH
+      # Verificar la conexión SSH con más opciones de diagnóstico
       - name: Verify SSH Connection
         run: |
-          echo "Verificando conexión SSH a la instancia EC2..."
-          ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} "echo 'Conexión SSH establecida correctamente'"
+          echo "Verificando detalles de la conexión SSH:"
+          echo "Host: ${{ secrets.EC2_HOST }}"
+          echo "Usuario: ${{ secrets.EC2_USER }}"
+          echo "Verificando que la clave SSH está configurada correctamente..."
+          ls -la ~/.ssh/
+          
+          echo "Intentando conexión SSH con opciones de verbose..."
+          ssh -v -o StrictHostKeyChecking=no -o ConnectTimeout=30 ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} "echo 'Conexión SSH establecida correctamente'"
           if [ $? -ne 0 ]; then
-            echo "Error: No se pudo establecer conexión SSH con la instancia. Verifica la clave SSH y los datos de la instancia."
+            echo "Error: No se pudo establecer conexión SSH con la instancia. Verificando accesibilidad..."
+            # Intentar verificar si el host es accesible
+            ping -c 4 ${{ secrets.EC2_HOST }} || echo "El host no responde a ping"
             exit 1
           fi
       
@@ -206,7 +207,7 @@ jobs:
       - name: Transfer files to EC2
         run: |
           echo "Transfiriendo archivos a la instancia EC2..."
-          scp -o StrictHostKeyChecking=no backend-deployment.tar.gz ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:/tmp/
+          scp -v -o StrictHostKeyChecking=no backend-deployment.tar.gz ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:/tmp/
           if [ $? -ne 0 ]; then
             echo "Error: No se pudieron transferir los archivos a la instancia EC2."
             exit 1
