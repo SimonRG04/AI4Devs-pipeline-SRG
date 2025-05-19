@@ -1,6 +1,7 @@
 name: CI/CD Pipeline SRG
 
 # Este pipeline se activa cuando se hace push a una rama que tiene un Pull Request abierto
+# Actualización: Agregado comentario para probar el trigger del workflow
 on:
   push:
     branches:
@@ -108,10 +109,10 @@ jobs:
         working-directory: backend
         run: |
           mkdir -p deployment
-          cp -r dist prisma package.json package-lock.json .env.example deployment/
+          cp -r dist prisma package.json package-lock.json deployment/
           cd deployment
           echo "NODE_ENV=production" > .env
-          echo "DATABASE_URL=${{ secrets.DATABASE_URL }}" >> .env
+          echo "DATABASE_URL=postgresql://test:test@localhost:5432/testdb" >> .env
           cd ..
           tar -czf backend-deployment.tar.gz deployment
       
@@ -127,63 +128,170 @@ jobs:
   deploy:
     needs: build
     runs-on: ubuntu-latest
+    # Especificar el entorno donde están configurados los secrets
+    environment: Testing
+    
+    # Validamos que el PR esté abierto
+    if: needs.check_pr.outputs.has_pr == 'true'
     
     steps:
+      - name: Verify required secrets
+        id: check_secrets
+        run: |
+          missing_secrets=()
+          
+          # Verificar solo los secrets de EC2 que son esenciales
+          [ -z "${{ secrets.EC2_SSH_PRIVATE_KEY }}" ] && missing_secrets+=("EC2_SSH_PRIVATE_KEY")
+          [ -z "${{ secrets.EC2_HOST }}" ] && missing_secrets+=("EC2_HOST")
+          [ -z "${{ secrets.EC2_USER }}" ] && missing_secrets+=("EC2_USER")
+          
+          if [ ${#missing_secrets[@]} -ne 0 ]; then
+            echo "Error: Los siguientes secrets son necesarios pero no están definidos:"
+            printf "  - %s\n" "${missing_secrets[@]}"
+            exit 1
+          fi
+          
+          echo "Todos los secrets necesarios para SSH están configurados"
+      
       - name: Download artifact
         uses: actions/download-artifact@v4
         with:
           name: backend-build
       
-      # Configurar las credenciales de AWS
-      # Este paso establece las credenciales necesarias para interactuar con AWS
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.AWS_REGION }}
+      # Diagnóstico de red para verificar conectividad
+      - name: Network diagnostics
+        run: |
+          echo "Diagnóstico de red:"
+          echo "Verificando resolución DNS..."
+          nslookup ${{ secrets.EC2_HOST }} || echo "Error en resolución DNS para el host EC2"
+          
+          echo "Verificando conectividad..."
+          ping -c 4 ${{ secrets.EC2_HOST }} || echo "Error en conectividad a EC2"
       
-      # Configurar SSH para conectarse a la instancia EC2
-      # Este paso prepara la autenticación SSH para la conexión segura a la instancia
-      - name: Setup SSH
+      # Extraer la clave pública a partir de la privada para verificación
+      - name: Extract public key from private key
         run: |
           mkdir -p ~/.ssh
           echo "${{ secrets.EC2_SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
-          ssh-keyscan -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts
+          
+          # Generar y mostrar la clave pública correspondiente
+          ssh-keygen -y -f ~/.ssh/id_rsa || { 
+            echo "ERROR: No se pudo generar la clave pública. Verificar formato de la clave privada"; 
+            echo "Primeras líneas de la clave privada:";
+            head -n 2 ~/.ssh/id_rsa | cat -A;
+            exit 1; 
+          }
+          
+          ssh-keygen -y -f ~/.ssh/id_rsa > ~/.ssh/id_rsa.pub
+          
+          echo "=========================================================="
+          echo "ATENCIÓN: Para que la conexión SSH funcione correctamente,"
+          echo "esta clave pública debe estar en el archivo authorized_keys"
+          echo "del usuario ${{ secrets.EC2_USER }} en la instancia EC2:"
+          echo "=========================================================="
+          cat ~/.ssh/id_rsa.pub
+          echo "=========================================================="
+          echo "Comando para añadir esta clave en la instancia EC2:"
+          echo "echo '$(cat ~/.ssh/id_rsa.pub)' >> ~/.ssh/authorized_keys"
+          echo "=========================================================="
       
-      # Transferir los archivos a la instancia EC2
-      # Este paso envía el paquete de despliegue a la instancia de EC2 
-      - name: Transfer files to EC2
+      # Intentar conexión con claves explícitas y verificación exhaustiva
+      - name: Test SSH connection
         run: |
-          scp -o StrictHostKeyChecking=no backend-deployment.tar.gz ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:/tmp/
+          # Configurar SSH con mayor nivel de debug
+          echo "LogLevel DEBUG3" >> ~/.ssh/config
+          chmod 600 ~/.ssh/config
+          
+          # Probar conexión con verbose y timeout extendido
+          ssh -vvv -o StrictHostKeyChecking=no -o ConnectTimeout=30 -i ~/.ssh/id_rsa ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} "echo 'Prueba de conexión'" || {
+            echo "ERROR: Fallo de conexión SSH"
+            echo "Verificando formato de la clave:"
+            file ~/.ssh/id_rsa
+            echo "Verificando permisos:"
+            ls -la ~/.ssh/
+            echo "Continuamos con método alternativo"
+          }
       
-      # Ejecutar comandos de despliegue en la instancia EC2
-      # Este paso despliega la aplicación en el servidor, descomprimiendo los archivos,
-      # instalando dependencias y reiniciando el servicio
+      # Usar acción SSH dedicada como alternativa
+      - name: Desplegar con SSH Action
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+          port: 22
+          command_timeout: 60m
+          debug: true
+          script: |
+            echo "Conexión SSH establecida correctamente desde la acción SSH"
+            echo "Verificando sistema:"
+            uname -a
+            echo "Usuario actual:"
+            whoami
+            echo "Directorio actual:"
+            pwd
+      
+      # Transferir archivos usando scp-action
+      - name: SCP files to EC2
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+          port: 22
+          debug: true
+          source: "backend-deployment.tar.gz"
+          target: "/tmp"
+          
+      # Desplegar usando la acción SSH
       - name: Deploy to EC2
-        run: |
-          ssh -o StrictHostKeyChecking=no ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'EOF'
-            # Detener el servicio actual
-            sudo systemctl stop backend-service || true
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+          port: 22
+          command_timeout: 60m
+          debug: true
+          script: |
+            set -e  # Detener en caso de error
             
+            echo "Deteniendo el servicio actual..."
+            # Detener el servicio actual si existe
+            if systemctl is-active --quiet backend-service; then
+              sudo systemctl stop backend-service || echo "No se pudo detener el servicio, pero continuamos"
+            else
+              echo "El servicio no está actualmente en ejecución"
+            fi
+            
+            echo "Limpiando directorio anterior..."
             # Limpiar directorio anterior si existe
             sudo rm -rf /opt/backend
             sudo mkdir -p /opt/backend
             
+            echo "Descomprimiendo el nuevo paquete..."
             # Descomprimir el nuevo paquete
-            sudo tar -xzf /tmp/backend-deployment.tar.gz -C /opt/
-            sudo mv /opt/deployment/* /opt/backend/
+            if [ ! -f /tmp/backend-deployment.tar.gz ]; then
+              echo "Error: El archivo de despliegue no existe en /tmp/"
+              exit 1
+            fi
+            
+            sudo tar -xzf /tmp/backend-deployment.tar.gz -C /opt/ || { echo "Error al descomprimir"; exit 1; }
+            sudo mv /opt/deployment/* /opt/backend/ || { echo "Error al mover archivos"; exit 1; }
             sudo rm -rf /opt/deployment
             sudo rm /tmp/backend-deployment.tar.gz
             
+            echo "Configurando permisos..."
             # Configurar permisos
             sudo chown -R $USER:$USER /opt/backend
             
+            echo "Instalando dependencias de producción..."
             # Instalar dependencias de producción
             cd /opt/backend
             npm ci --only=production
             
+            echo "Configurando el servicio systemd..."
             # Crear o actualizar el servicio systemd
             sudo tee /etc/systemd/system/backend-service.service > /dev/null << 'EOT'
             [Unit]
@@ -202,11 +310,22 @@ jobs:
             WantedBy=multi-user.target
             EOT
             
+            echo "Recargando configuración de systemd..."
             # Recargar configuración systemd y reiniciar el servicio
             sudo systemctl daemon-reload
             sudo systemctl enable backend-service
+            
+            echo "Iniciando el servicio..."
             sudo systemctl start backend-service
             
+            echo "Verificando estado del servicio..."
             # Verificar estado del servicio
             sudo systemctl status backend-service --no-pager
-          EOF 
+            
+            # Verificar que el servicio está realmente en ejecución
+            if ! systemctl is-active --quiet backend-service; then
+              echo "ERROR: El servicio no se inició correctamente"
+              exit 1
+            else
+              echo "Servicio desplegado y en ejecución correctamente"
+            fi 
