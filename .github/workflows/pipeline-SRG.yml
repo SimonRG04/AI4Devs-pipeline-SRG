@@ -163,76 +163,72 @@ jobs:
         run: |
           echo "Diagnóstico de red:"
           echo "Verificando resolución DNS..."
-          nslookup amazonaws.com || echo "Error en resolución DNS para amazonaws.com"
+          nslookup ${{ secrets.EC2_HOST }} || echo "Error en resolución DNS para el host EC2"
           
           echo "Verificando conectividad..."
-          ping -c 4 amazonaws.com || echo "Error en conectividad a amazonaws.com"
-          
-          echo "Verificando detalles de AWS_REGION..."
-          echo "Región: ${{ secrets.AWS_REGION || 'No configurado' }}"
+          ping -c 4 ${{ secrets.EC2_HOST }} || echo "Error en conectividad a EC2"
       
-      # Configurar SSH con mejor formato de clave
-      - name: Setup SSH
+      # Extraer la clave pública a partir de la privada para verificación
+      - name: Extract public key from private key
         run: |
           mkdir -p ~/.ssh
-          
-          # Corregir formato de la clave SSH
-          echo "${{ secrets.EC2_SSH_PRIVATE_KEY }}" | sed 's/\\n/\n/g' > ~/.ssh/id_rsa
-          
-          # Verificar formato de la clave
-          echo "Primeras líneas de la clave:"
-          head -n 2 ~/.ssh/id_rsa
-          echo "Últimas líneas de la clave:"
-          tail -n 2 ~/.ssh/id_rsa
-          
-          # Corregir permisos
+          echo "${{ secrets.EC2_SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
           
-          # Mostrar tipo de archivo para diagnóstico
-          file ~/.ssh/id_rsa
+          # Generar y mostrar la clave pública correspondiente
+          ssh-keygen -y -f ~/.ssh/id_rsa > ~/.ssh/id_rsa.pub
           
-          # Obtener huella digital del host
-          ssh-keyscan -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts
+          echo "=========================================================="
+          echo "ATENCIÓN: Para que la conexión SSH funcione correctamente,"
+          echo "esta clave pública debe estar en el archivo authorized_keys"
+          echo "del usuario ${{ secrets.EC2_USER }} en la instancia EC2:"
+          echo "=========================================================="
+          cat ~/.ssh/id_rsa.pub
+          echo "=========================================================="
+          echo "Comando para añadir esta clave en la instancia EC2:"
+          echo "echo '$(cat ~/.ssh/id_rsa.pub)' >> ~/.ssh/authorized_keys"
+          echo "=========================================================="
       
-      # Verificar la conexión SSH con enfoque alternativo
-      - name: Verify SSH Connection
+      # Intentar conexión con claves explícitas
+      - name: Test SSH connection
         run: |
-          echo "Verificando detalles de la conexión SSH:"
-          echo "Host: ${{ secrets.EC2_HOST }}"
-          echo "Usuario: ${{ secrets.EC2_USER }}"
-          
-          # Intentar conexión con opciones de autenticación explícitas
-          ssh -v -o StrictHostKeyChecking=no -o ConnectTimeout=30 -i ~/.ssh/id_rsa ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} "echo 'Conexión SSH establecida correctamente'"
-          
-          if [ $? -ne 0 ]; then
-            echo "Error: No se pudo establecer conexión SSH. Generando nueva clave para prueba:"
-            
-            # Generar una nueva clave para diagnóstico
-            ssh-keygen -t rsa -f ~/.ssh/test_key -N ""
-            echo "Clave de prueba generada. Si quieres usar esta clave:"
-            cat ~/.ssh/test_key.pub
-            
-            echo "Verificando accesibilidad del host..."
-            ping -c 4 ${{ secrets.EC2_HOST }} || echo "El host no responde a ping"
-            exit 1
-          fi
+          # Probar conexión con verbose y timeout extendido
+          ssh -v -o StrictHostKeyChecking=no -o ConnectTimeout=30 -i ~/.ssh/id_rsa ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} "echo 'Prueba de conexión'" || echo "Fallo de conexión SSH, pero continuamos con método alternativo"
       
-      # Transferir los archivos a la instancia EC2
-      - name: Transfer files to EC2
-        run: |
-          echo "Transfiriendo archivos a la instancia EC2..."
-          scp -v -o StrictHostKeyChecking=no -i ~/.ssh/id_rsa backend-deployment.tar.gz ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:/tmp/
-          if [ $? -ne 0 ]; then
-            echo "Error: No se pudieron transferir los archivos a la instancia EC2."
-            exit 1
-          fi
-          echo "Archivos transferidos correctamente."
+      # Usar acción SSH dedicada como alternativa
+      - name: Desplegar con SSH Action
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+          script: |
+            echo "Conexión SSH establecida correctamente desde la acción SSH"
+            echo "Verificando sistema:"
+            uname -a
+            echo "Usuario actual:"
+            whoami
+            echo "Directorio actual:"
+            pwd
       
-      # Ejecutar comandos de despliegue en la instancia EC2
+      # Transferir archivos usando scp-action
+      - name: SCP files to EC2
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+          source: "backend-deployment.tar.gz"
+          target: "/tmp"
+          
+      # Desplegar usando la acción SSH
       - name: Deploy to EC2
-        run: |
-          echo "Iniciando despliegue en la instancia EC2..."
-          ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_rsa ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'EOF'
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+          script: |
             set -e  # Detener en caso de error
             
             echo "Deteniendo el servicio actual..."
@@ -306,12 +302,4 @@ jobs:
               exit 1
             else
               echo "Servicio desplegado y en ejecución correctamente"
-            fi
-          EOF
-          
-          if [ $? -ne 0 ]; then
-            echo "Error durante el despliegue en la instancia EC2."
-            exit 1
-          fi
-          
-          echo "¡Despliegue completado con éxito!" 
+            fi 
